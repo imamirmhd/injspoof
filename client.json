@@ -1,0 +1,50 @@
+{
+    "listen": {
+        "address": "127.0.0.1",
+        "port": 50866
+    },
+    "connect": {
+        "to": {
+            "address": "xx.xx.xx.xx",
+            "port": 5050
+        },
+        "with": {
+            "source": {
+                "address": {
+                    "type": "file",
+                    "value": "ips.txt"
+                },
+                "port": [
+                    7443
+                ]
+            }
+        },
+        "protocol": {
+            "mode": "udp"
+        }
+    },
+    "capture": {
+        "interface": "enp7s0",
+        "filter": {
+            "source": {
+                "address": {
+                    "type": "static",
+                    "value": [
+                        "194.225.101.0/24"
+                    ]
+                },
+                "port": [
+                    2443
+                ]
+            }
+        }
+    },
+    "outgoing": {
+        "interface": "enp7s0",
+        "gateway_mac": "ff:ff:ff:ff:ff:ff"
+    },
+    "tuning": {
+        "fragment_size": 1400,
+        "ip_selection_strategy": "round_robin"
+    }
+}

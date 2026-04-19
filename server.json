@@ -1,0 +1,57 @@
+{
+    "forward": {
+        "address": "127.0.0.1",
+        "port": 8087
+    },
+    "response": {
+        "to": {
+            "address": "xx.xx.xx.xx",
+            "port": 5008
+        },
+        "with": {
+            "source": {
+                "address": {
+                    "type": "static",
+                    "value": [
+                        "194.225.101.190"
+                    ]
+                },
+                "port": [
+                    2443
+                ]
+            }
+        },
+        "protocol": {
+            "mode": "udp"
+        }
+    },
+    "capture": {
+        "interface": "eth0",
+        "filter": {
+            "source": {
+                "address": {
+                    "type": "static",
+                    "value": [
+                        "2.188.21.42",
+                        "2.188.21.41"
+                    ]
+                },
+                "port": {
+                    "type": "static",
+                    "value": [
+                        7443
+                    ]
+                }
+            }
+        }
+    },
+    "outgoing": {
+        "interface": "eth0",
+        "gateway_mac": "ff:ff:ff:ff:ff:ff"
+    },
+    "tuning": {
+        "fragment_size": 1400,
+        "ip_selection_strategy": "round_robin",
+        "steal_client_source_ip": false
+    }
+}
