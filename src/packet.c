@@ -330,7 +330,7 @@ static int send_fragments(uint8_t *buf,
     return (int)transport_len;
 }
 
-int pkt_send_tcp_fragmented(uint8_t *buf,
+int pkt_send_tcp_fragmented(uint8_t *buf, uint8_t *scratch,
                             const uint8_t src_mac[6], const uint8_t dst_mac[6],
                             uint32_t src_ip, uint32_t dst_ip,
                             uint16_t src_port, uint16_t dst_port,
@@ -352,15 +352,14 @@ int pkt_send_tcp_fragmented(uint8_t *buf,
         return send_fn(buf, frame_len, send_ctx);
     }
 
-    /* Build complete transport segment (TCP header + payload) in a temp buffer */
-    uint8_t transport_buf[MAX_PACKET_SIZE];
+    /* Build complete transport segment in caller-provided scratch buffer */
     if (transport_len > MAX_PACKET_SIZE) {
         LOG_ERROR("packet: tcp transport too large (%u)", transport_len);
         return -1;
     }
 
     /* TCP header */
-    struct tcp_header *tcp = (struct tcp_header *)transport_buf;
+    struct tcp_header *tcp = (struct tcp_header *)scratch;
     memset(tcp, 0, TCP_HLEN);
     tcp->src_port      = htons(src_port);
     tcp->dst_port      = htons(dst_port);
@@ -377,18 +376,18 @@ int pkt_send_tcp_fragmented(uint8_t *buf,
 
     /* Payload */
     if (payload && payload_len > 0)
-        memcpy(transport_buf + TCP_HLEN, payload, payload_len);
+        memcpy(scratch + TCP_HLEN, payload, payload_len);
 
     /* Compute TCP checksum over the full unfragmented segment */
     tcp->check = transport_checksum(src_ip, dst_ip, 6, tcp, transport_len);
 
     return send_fragments(buf, src_mac, dst_mac, src_ip, dst_ip,
                           6 /* IPPROTO_TCP */,
-                          transport_buf, transport_len,
+                          scratch, transport_len,
                           fragment_size, send_fn, send_ctx);
 }
 
-int pkt_send_udp_fragmented(uint8_t *buf,
+int pkt_send_udp_fragmented(uint8_t *buf, uint8_t *scratch,
                             const uint8_t src_mac[6], const uint8_t dst_mac[6],
                             uint32_t src_ip, uint32_t dst_ip,
                             uint16_t src_port, uint16_t dst_port,
@@ -409,15 +408,14 @@ int pkt_send_udp_fragmented(uint8_t *buf,
         return send_fn(buf, frame_len, send_ctx);
     }
 
-    /* Build complete transport segment (UDP header + payload) in a temp buffer */
-    uint8_t transport_buf[MAX_PACKET_SIZE];
+    /* Build complete transport segment in caller-provided scratch buffer */
     if (transport_len > MAX_PACKET_SIZE) {
         LOG_ERROR("packet: udp transport too large (%u)", transport_len);
         return -1;
     }
 
     /* UDP header */
-    struct udp_header *udp = (struct udp_header *)transport_buf;
+    struct udp_header *udp = (struct udp_header *)scratch;
     udp->src_port = htons(src_port);
     udp->dst_port = htons(dst_port);
     udp->len      = htons(transport_len);
@@ -425,7 +423,7 @@ int pkt_send_udp_fragmented(uint8_t *buf,
 
     /* Payload */
     if (payload && payload_len > 0)
-        memcpy(transport_buf + UDP_HLEN, payload, payload_len);
+        memcpy(scratch + UDP_HLEN, payload, payload_len);
 
     /* UDP checksum over the full unfragmented datagram */
     udp->check = transport_checksum(src_ip, dst_ip, 17, udp, transport_len);
@@ -434,7 +432,7 @@ int pkt_send_udp_fragmented(uint8_t *buf,
 
     return send_fragments(buf, src_mac, dst_mac, src_ip, dst_ip,
                           17 /* IPPROTO_UDP */,
-                          transport_buf, transport_len,
+                          scratch, transport_len,
                           fragment_size, send_fn, send_ctx);
 }
 

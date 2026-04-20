@@ -169,6 +169,7 @@ sudo ./injspoof --mode server --config server.json
 | `outgoing` | `interface`, `gateway_mac` | Interface and next-hop MAC for sending raw packets. |
 | `tuning.fragment_size` | integer | IP fragmentation threshold in bytes (default: 1400, range: 68–9000). |
 | `tuning.ip_selection_strategy` | `"round_robin"` | How to rotate through multiple source IPs. |
+| `tuning.log_level` | `"info"` | Log verbosity: `"error"`, `"warn"`, `"info"`, or `"debug"`. |
 | `tuning.steal_client_source_ip` | boolean | **Server only**: use the incoming packet's spoofed source IP as the response source. |
 
 ### Source Address Modes
@@ -336,15 +337,15 @@ ip neigh show
 
 ## Performance Notes
 
-injspoof operates at Layer 2 (`AF_PACKET`) for maximum performance:
+injspoof operates at Layer 2 (`AF_PACKET`) for maximum performance under extreme load:
 
-- **Zero-copy path**: Packets are built directly in userspace buffers and sent via the kernel's packet socket — no IP stack traversal
-- **PACKET_QDISC_BYPASS**: Bypasses the kernel's traffic control queueing discipline for lower latency
-- **SO_BUSY_POLL**: Reduces receive latency by polling the NIC driver directly
-- **Pre-compiled IP filters**: All filter IPs are converted to `uint32_t` at config load time — no string parsing on the hot path
-- **Lock-free memory pool**: Atomic CAS-based buffer pool eliminates malloc/free on the hot path
-- **Large socket buffers**: 4MB send/receive buffers for burst absorption
-- **IP fragmentation**: Configurable RFC 791 fragmentation with proper MF flags and 8-byte alignment
+- **Zero-copy path**: Packets are built directly in userspace buffers and sent via the kernel's packet socket — no IP stack traversal.
+- **Batched Edge-Triggered Syscalls**: Uses `EPOLLET` (edge-triggered) `epoll` coupled with `recvmmsg` to drain up to 32 frames in a single kernel boundary crossing, drastically minimizing syscall overhead.
+- **Kernel CIDR BPF Filtering**: Inject host byte-order bounds checking (`JGE`/`JGT`) directly into Kernel BPF to drop unwanted packets instantly, cleanly scaling IP and Port subnet filtering before userspace.
+- **Aggressive Buffering**: Employs `SO_RCVBUFFORCE` (16MB) on raw sockets and 8MB on UDP sockets to eliminate kernel-side packet drops.
+- **O(1) Session Hash Table**: Pre-allocated 256K connection-tracker (14MB memory print) with an ultra-fast 5-second asynchronous GC threshold, securely anchoring high-volume IP rotation without linear slowdowns.
+- **Lock-free memory pool**: Atomic CAS-based buffer pool eliminates heap fragmentation and malloc/free thrashing entirely on the hot path.
+- **IP fragmentation**: Configurable RFC 791 fragmentation fully batched from pre-allocated scratch pools rather than dynamic stack VLAs.
 
 ## License
 

@@ -63,7 +63,7 @@ int pkt_build_udp(uint8_t *buf,
  * Each fragment is sent via the send_fn callback.
  * Returns total payload bytes processed on success, -1 on error.
  */
-int pkt_send_tcp_fragmented(uint8_t *buf,
+int pkt_send_tcp_fragmented(uint8_t *buf, uint8_t *scratch,
                             const uint8_t src_mac[6], const uint8_t dst_mac[6],
                             uint32_t src_ip, uint32_t dst_ip,
                             uint16_t src_port, uint16_t dst_port,
@@ -79,7 +79,7 @@ int pkt_send_tcp_fragmented(uint8_t *buf,
  * Each fragment is sent via the send_fn callback.
  * Returns total payload bytes processed on success, -1 on error.
  */
-int pkt_send_udp_fragmented(uint8_t *buf,
+int pkt_send_udp_fragmented(uint8_t *buf, uint8_t *scratch,
                             const uint8_t src_mac[6], const uint8_t dst_mac[6],
                             uint32_t src_ip, uint32_t dst_ip,
                             uint16_t src_port, uint16_t dst_port,

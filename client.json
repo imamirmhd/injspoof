@@ -45,6 +45,7 @@
     },
     "tuning": {
         "fragment_size": 1400,
-        "ip_selection_strategy": "round_robin"
+        "ip_selection_strategy": "round_robin",
+        "log_level": "info"
     }
 }

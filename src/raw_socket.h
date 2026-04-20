@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include <stdint.h>
+#include <sys/socket.h>
 
 /*
  * Initialize a raw sending socket (AF_PACKET, SOCK_RAW) on
@@ -15,7 +16,7 @@ int raw_send_init(const config_t *cfg);
 /*
  * Initialize a raw receiving socket (AF_PACKET, SOCK_RAW) on
  * the capture interface with a BPF filter attached.
- * Includes SO_BUSY_POLL for reduced latency.
+ * Includes SO_RCVBUFFORCE and PACKET_IGNORE_OUTGOING for performance.
  * Returns fd on success, -1 on error.
  */
 int raw_recv_init(const config_t *cfg);
@@ -25,5 +26,12 @@ int raw_recv_init(const config_t *cfg);
  * Returns bytes sent on success, -1 on error.
  */
 int raw_send(int fd, const config_t *cfg, const uint8_t *frame, int frame_len);
+
+/*
+ * Batch-send multiple pre-built raw Ethernet frames via sendmmsg.
+ * Returns number of messages sent on success, -1 on error.
+ */
+int raw_send_batch(int fd, const config_t *cfg,
+                   struct mmsghdr *msgs, int count);
 
 #endif /* INJSPOOF_RAW_SOCKET_H */

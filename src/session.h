@@ -16,9 +16,9 @@
  * forwarder connections so responses can be routed back.
  */
 
-#define SESSION_TABLE_SIZE  524288 /* Increased: ~500k concurrent connections (power of 2) */
-#define SESSION_MAX_PROBES  512    /* High probe distance to defeat hash clustering */
-#define SESSION_TTL         60     /* Decreased to 60s to aggressively GC dead UDP flows */
+#define SESSION_TABLE_SIZE  262144 /* ~256k concurrent connections (power of 2, ~14MB) */
+#define SESSION_MAX_PROBES  64     /* Wide probe distance for high load factors */
+#define SESSION_TTL         30     /* 30s — aggressive GC for fast-rotating spoofed flows */
 
 typedef struct {
     /* Key */
@@ -41,8 +41,9 @@ typedef struct {
     int active_count;   /* Track active entries to avoid O(n) scans */
 } session_table_t;
 
-/* Update the cached timestamp (call once per event loop iteration) */
-void session_update_time(void);
+/* Update the cached timestamp (call once per event loop iteration).
+ * Returns the cached time so callers can avoid a second time() syscall. */
+time_t session_update_time(void);
 
 /* Initialize (zero out) the session table */
 void session_init(session_table_t *tbl);

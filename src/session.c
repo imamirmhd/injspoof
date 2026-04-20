@@ -7,9 +7,10 @@
 /* Cached timestamp — updated once per event loop iteration, not per-packet */
 static time_t g_cached_time = 0;
 
-void session_update_time(void)
+time_t session_update_time(void)
 {
     g_cached_time = time(NULL);
+    return g_cached_time;
 }
 
 /* FNV-1a hash for session key */

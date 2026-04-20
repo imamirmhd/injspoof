@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
+/* Global log level — defined here, declared extern in log.h */
+int g_log_level = LOG_LEVEL_INFO;
+
 /* ---- helpers ---- */
 
 static int parse_mac(const char *str, uint8_t mac[6])
@@ -277,6 +280,7 @@ int config_load(config_t *cfg, const char *path, int mode)
     cfg->mode = mode;
     cfg->fragment_size = DEFAULT_FRAGMENT_SIZE;
     cfg->ip_strategy = BALANCE_ROUND_ROBIN;
+    cfg->log_level = LOG_LEVEL_INFO;  /* default */
     atomic_store(&cfg->rr_ip_index, 0);
     atomic_store(&cfg->rr_port_index, 0);
     strcpy(cfg->protocol.mode, "udp");  /* default */
@@ -458,6 +462,16 @@ int config_load(config_t *cfg, const char *path, int mode)
             if (cJSON_IsBool(steal)) {
                 cfg->steal_client_source_ip = cJSON_IsTrue(steal) ? 1 : 0;
             }
+
+            cJSON *loglvl = cJSON_GetObjectItemCaseSensitive(tuning, "log_level");
+            if (cJSON_IsString(loglvl)) {
+                const char *lvl = loglvl->valuestring;
+                if (strcmp(lvl, "error") == 0)       cfg->log_level = LOG_LEVEL_ERROR;
+                else if (strcmp(lvl, "warn") == 0)   cfg->log_level = LOG_LEVEL_WARN;
+                else if (strcmp(lvl, "info") == 0)   cfg->log_level = LOG_LEVEL_INFO;
+                else if (strcmp(lvl, "debug") == 0)  cfg->log_level = LOG_LEVEL_DEBUG;
+                else LOG_WARN("config: unknown log_level '%s', defaulting to 'info'", lvl);
+            }
         }
     }
 
@@ -480,6 +494,9 @@ int config_load(config_t *cfg, const char *path, int mode)
         LOG_ERROR("config: failed to detect index for capture '%s'", cfg->capture_iface);
         ret = -1; goto cleanup;
     }
+
+    /* Apply log level globally */
+    g_log_level = cfg->log_level;
 
     /* Default protocol */
     if (cfg->protocol.mode[0] == '\0')
@@ -539,6 +556,11 @@ void config_dump(const config_t *cfg)
 
     if (cfg->mode == MODE_SERVER)
         fprintf(stderr, "  steal_src_ip: %s\n", cfg->steal_client_source_ip ? "true" : "false");
+
+    static const char *level_names[] = { "error", "warn", "info", "debug" };
+    int lvl_idx = cfg->log_level;
+    if (lvl_idx < 0 || lvl_idx > 3) lvl_idx = 2;
+    fprintf(stderr, "  log_level:    %s\n", level_names[lvl_idx]);
 
     fprintf(stderr, "================================\n");
 }

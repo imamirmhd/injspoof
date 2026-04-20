@@ -22,8 +22,9 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
-#define MAX_EVENTS       64
-#define GC_INTERVAL      15
+#define MAX_EVENTS       256
+#define EPOLL_TIMEOUT_MS 50
+#define RECV_BATCH_SIZE  32
 
 extern volatile sig_atomic_t g_shutdown;
 
@@ -44,8 +45,11 @@ static int create_udp_listener(const endpoint_t *ep)
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    int rcvbuf = 2 * 1024 * 1024;
+    /* Performance: large recv + send buffers for burst absorption */
+    int rcvbuf = 8 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -165,7 +169,7 @@ int client_run(config_t *cfg)
     if (epoll_fd < 0) { LOG_PERROR("client: epoll_create1"); goto cleanup; }
 
     struct epoll_event ev;
-    ev.events = EPOLLIN; ev.data.fd = udp_fd;
+    ev.events = EPOLLIN | EPOLLET; ev.data.fd = udp_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, udp_fd, &ev);
     ev.events = EPOLLIN | EPOLLET; ev.data.fd = raw_recv_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, raw_recv_fd, &ev);
@@ -176,7 +180,7 @@ int client_run(config_t *cfg)
 
     /* ---- Event Loop ---- */
     while (!g_shutdown) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             LOG_PERROR("client: epoll_wait");
@@ -190,15 +194,17 @@ int client_run(config_t *cfg)
 
             /* ---- UDP listener: app → raw tunnel ---- */
             if (fd == udp_fd) {
+                /* Edge-triggered: drain all available packets */
+                for (;;) {
                 uint8_t *buf = (uint8_t *)pool_alloc(&pool);
-                if (!buf) continue;
+                if (!buf) break;
 
                 struct sockaddr_in peer;
                 socklen_t peer_len = sizeof(peer);
 
                 ssize_t n = recvfrom(udp_fd, buf, POOL_DEFAULT_BUFSIZE, MSG_DONTWAIT,
                                      (struct sockaddr *)&peer, &peer_len);
-                if (n <= 0) { pool_free(&pool, buf); continue; }
+                if (n <= 0) { pool_free(&pool, buf); break; }
                 if (n > 65535) {
                     LOG_WARN("client: payload too large (%zd)", n);
                     pool_free(&pool, buf);
@@ -224,11 +230,13 @@ int client_run(config_t *cfg)
 
                 /* Build and send spoofed raw packet */
                 uint8_t *pkt_buf = (uint8_t *)pool_alloc(&pool);
-                if (!pkt_buf) { pool_free(&pool, buf); continue; }
+                if (!pkt_buf) { pool_free(&pool, buf); break; }
+                uint8_t *scratch = (uint8_t *)pool_alloc(&pool);
+                if (!scratch) { pool_free(&pool, pkt_buf); pool_free(&pool, buf); break; }
 
                 int rc;
                 if (use_tcp_obfs) {
-                    rc = pkt_send_tcp_fragmented(pkt_buf,
+                    rc = pkt_send_tcp_fragmented(pkt_buf, scratch,
                                                  cfg->outgoing_mac, cfg->gateway_mac,
                                                  src_ip, remote_addr.s_addr,
                                                  src_port, cfg->remote.port,
@@ -237,7 +245,7 @@ int client_run(config_t *cfg)
                                                  cfg->fragment_size,
                                                  raw_send_cb, &send_ctx);
                 } else {
-                    rc = pkt_send_udp_fragmented(pkt_buf,
+                    rc = pkt_send_udp_fragmented(pkt_buf, scratch,
                                                  cfg->outgoing_mac, cfg->gateway_mac,
                                                  src_ip, remote_addr.s_addr,
                                                  src_port, cfg->remote.port,
@@ -257,79 +265,114 @@ int client_run(config_t *cfg)
 #endif
                 }
 
+                pool_free(&pool, scratch);
                 pool_free(&pool, pkt_buf);
                 pool_free(&pool, buf);
+                } /* end drain loop */
             }
 
             /* ---- Raw socket: response from tunnel → local app ---- */
             else if (fd == raw_recv_fd) {
-                /* Edge-triggered: drain all available packets */
+                /* Edge-triggered: drain via recvmmsg batches */
                 for (;;) {
-                uint8_t *buf = (uint8_t *)pool_alloc(&pool);
-                if (!buf) break;
+                /* Pre-allocate batch of buffers from pool */
+                uint8_t *batch_bufs[RECV_BATCH_SIZE];
+                struct mmsghdr batch_msgs[RECV_BATCH_SIZE];
+                struct iovec batch_iovs[RECV_BATCH_SIZE];
+                int batch_count = 0;
 
-                ssize_t n = recv(raw_recv_fd, buf, POOL_DEFAULT_BUFSIZE, MSG_DONTWAIT);
-                if (n <= 0) { pool_free(&pool, buf); break; }
-
-                if (n < (ssize_t)(ETH_HLEN_CONST + IP_HLEN)) {
-                    pool_free(&pool, buf);
-                    continue;
+                for (int j = 0; j < RECV_BATCH_SIZE; j++) {
+                    batch_bufs[j] = (uint8_t *)pool_alloc(&pool);
+                    if (!batch_bufs[j]) break;
+                    batch_iovs[j].iov_base = batch_bufs[j];
+                    batch_iovs[j].iov_len  = POOL_DEFAULT_BUFSIZE;
+                    memset(&batch_msgs[j], 0, sizeof(struct mmsghdr));
+                    batch_msgs[j].msg_hdr.msg_iov    = &batch_iovs[j];
+                    batch_msgs[j].msg_hdr.msg_iovlen = 1;
+                    batch_count++;
                 }
 
-                struct iphdr *iph = (struct iphdr *)(buf + ETH_HLEN_CONST);
-                int ip_hlen = iph->ihl * 4;
-                if (n < (ssize_t)(ETH_HLEN_CONST + ip_hlen)) {
-                    pool_free(&pool, buf);
-                    continue;
+                if (batch_count == 0) break;
+
+                int nrecvd = recvmmsg(raw_recv_fd, batch_msgs, (unsigned int)batch_count,
+                                      MSG_DONTWAIT, NULL);
+                if (nrecvd <= 0) {
+                    /* Return all pre-allocated buffers */
+                    for (int j = 0; j < batch_count; j++)
+                        pool_free(&pool, batch_bufs[j]);
+                    break;
                 }
 
-                uint32_t pkt_src_ip = iph->saddr;
-                uint16_t pkt_src_port = 0;
-                int transport_offset = ETH_HLEN_CONST + ip_hlen;
-                uint8_t *transport = buf + transport_offset;
-                uint8_t *payload = NULL;
-                int payload_len = 0;
+                /* Return unused buffers */
+                for (int j = nrecvd; j < batch_count; j++)
+                    pool_free(&pool, batch_bufs[j]);
 
-                if (iph->protocol == IPPROTO_TCP) {
-                    if (n < (ssize_t)(transport_offset + TCP_HLEN)) {
+                /* Process received packets */
+                for (int j = 0; j < nrecvd; j++) {
+                    uint8_t *buf = batch_bufs[j];
+                    ssize_t n = (ssize_t)batch_msgs[j].msg_len;
+
+                    if (n < (ssize_t)(ETH_HLEN_CONST + IP_HLEN)) {
                         pool_free(&pool, buf); continue;
                     }
-                    struct tcphdr *tcph = (struct tcphdr *)transport;
-                    pkt_src_port = ntohs(tcph->source);
-                    int tcp_hlen = tcph->doff * 4;
-                    payload = transport + tcp_hlen;
-                    payload_len = (int)n - transport_offset - tcp_hlen;
-                } else if (iph->protocol == IPPROTO_UDP) {
-                    if (n < (ssize_t)(transport_offset + UDP_HLEN)) {
+
+                    struct iphdr *iph = (struct iphdr *)(buf + ETH_HLEN_CONST);
+                    int ip_hlen = iph->ihl * 4;
+                    if (n < (ssize_t)(ETH_HLEN_CONST + ip_hlen)) {
                         pool_free(&pool, buf); continue;
                     }
-                    struct udphdr *udph = (struct udphdr *)transport;
-                    pkt_src_port = ntohs(udph->source);
-                    payload = transport + UDP_HLEN;
-                    payload_len = (int)n - transport_offset - UDP_HLEN;
-                } else {
-                    pool_free(&pool, buf); continue;
+
+                    uint32_t pkt_src_ip = iph->saddr;
+                    uint16_t pkt_src_port = 0;
+                    int transport_offset = ETH_HLEN_CONST + ip_hlen;
+                    uint8_t *transport = buf + transport_offset;
+                    uint8_t *payload = NULL;
+                    int payload_len = 0;
+
+                    if (iph->protocol == IPPROTO_TCP) {
+                        if (n < (ssize_t)(transport_offset + TCP_HLEN)) {
+                            pool_free(&pool, buf); continue;
+                        }
+                        struct tcphdr *tcph = (struct tcphdr *)transport;
+                        pkt_src_port = ntohs(tcph->source);
+                        int tcp_hlen = tcph->doff * 4;
+                        payload = transport + tcp_hlen;
+                        payload_len = (int)n - transport_offset - tcp_hlen;
+                    } else if (iph->protocol == IPPROTO_UDP) {
+                        if (n < (ssize_t)(transport_offset + UDP_HLEN)) {
+                            pool_free(&pool, buf); continue;
+                        }
+                        struct udphdr *udph = (struct udphdr *)transport;
+                        pkt_src_port = ntohs(udph->source);
+                        payload = transport + UDP_HLEN;
+                        payload_len = (int)n - transport_offset - UDP_HLEN;
+                    } else {
+                        pool_free(&pool, buf); continue;
+                    }
+
+                    if (payload_len <= 0) { pool_free(&pool, buf); continue; }
+
+                    /* Userspace filter (pre-compiled IPs — no inet_pton) */
+                    if (!filter_match(cfg, pkt_src_ip, pkt_src_port)) {
+                        pool_free(&pool, buf); continue;
+                    }
+
+                    LOG_DEBUG("client: filter MATCHED, forwarding %d bytes to local app", payload_len);
+
+                    /* Forward to local app directly (no session lookup needed) */
+                    if (has_local_peer) {
+                        sendto(udp_fd, payload, (size_t)payload_len, MSG_DONTWAIT,
+                               (struct sockaddr *)&local_peer,
+                               sizeof(local_peer));
+                    } else {
+                        LOG_DEBUG("client: no local peer yet, dropping response");
+                    }
+
+                    pool_free(&pool, buf);
                 }
 
-                if (payload_len <= 0) { pool_free(&pool, buf); continue; }
-
-                /* Userspace filter (pre-compiled IPs — no inet_pton) */
-                if (!filter_match(cfg, pkt_src_ip, pkt_src_port)) {
-                    pool_free(&pool, buf); continue;
-                }
-
-                LOG_DEBUG("client: filter MATCHED, forwarding %d bytes to local app", payload_len);
-
-                /* Forward to local app directly (no session lookup needed) */
-                if (has_local_peer) {
-                    sendto(udp_fd, payload, (size_t)payload_len, MSG_DONTWAIT,
-                           (struct sockaddr *)&local_peer,
-                           sizeof(local_peer));
-                } else {
-                    LOG_DEBUG("client: no local peer yet, dropping response");
-                }
-
-                pool_free(&pool, buf);
+                /* If we got fewer than requested, socket is drained */
+                if (nrecvd < batch_count) break;
                 } /* end drain loop */
             }
         }

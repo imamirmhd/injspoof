@@ -52,6 +52,7 @@
     "tuning": {
         "fragment_size": 1400,
         "ip_selection_strategy": "round_robin",
-        "steal_client_source_ip": false
+        "steal_client_source_ip": false,
+        "log_level": "info"
     }
 }

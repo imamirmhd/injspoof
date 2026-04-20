@@ -100,6 +100,7 @@ typedef struct {
     uint16_t        fragment_size;
     balance_strategy_t ip_strategy;
     int             steal_client_source_ip;  /* server only */
+    int             log_level;               /* 0=error, 1=warn, 2=info, 3=debug */
 
     /* --- Derived at runtime --- */
     uint8_t         outgoing_mac[6];     /* auto-detected from outgoing_iface */

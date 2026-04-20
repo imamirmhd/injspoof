@@ -63,30 +63,37 @@ static int attach_bpf_filter(int fd, const config_t *cfg)
     int ethertype_jf_idx = n - 1; /* jf fixup → reject */
 
     /* ---- IP source check (OR chain) ---- */
-    if (ip_count > 0) {
+    int bpf_ip_count = (ip_count > 64) ? 64 : ip_count;
+    int ip_jump_indices[64];
+    int reject_ip_idx = -1;
+
+    if (bpf_ip_count > 0) {
         code[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 26);
 
-        for (int i = 0; i < ip_count; i++) {
-            uint32_t ip_host = flt->subnets[i].first_ip; // Host order
-            int remaining = ip_count - 1 - i;
+        for (int i = 0; i < bpf_ip_count; i++) {
+            uint32_t first = flt->subnets[i].first_ip; /* Host order (BPF loads in host order) */
+            uint32_t last  = flt->subnets[i].last_ip;
 
-            if (i == ip_count - 1) {
-                /* Last IP: match → go to port check, no match → reject */
-                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                         ip_host, 0, 0);
-                /* jf fixup needed → reject */
+            if (first == last) {
+                ip_jump_indices[i] = n;
+                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, first, 0, 0);
             } else {
-                /* Not last: match → skip remaining IPs to port check */
-                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                         ip_host,
-                                                         (uint8_t)remaining, 0);
+                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, first, 0, 2);
+                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, last, 1, 0);
+                ip_jump_indices[i] = n;
+                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JA, 0, 0, 0);
             }
         }
+        reject_ip_idx = n;
+        code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JA, 0, 0, 0);
     }
 
-    int after_ip_idx = n; /* index right after IP checks */
+    int accept_ip_idx = n; /* index right after IP checks (starts Port check) */
 
     /* ---- Port check ---- */
+    int port_jump_indices[16];
+    int reject_port_idx = -1;
+
     if (port_count > 0) {
         /* Load IHL to find transport header */
         code[n++] = (struct sock_filter)BPF_STMT(BPF_LDX | BPF_B | BPF_MSH, 14);
@@ -94,20 +101,11 @@ static int attach_bpf_filter(int fd, const config_t *cfg)
         code[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_H | BPF_IND, 14);
 
         for (int i = 0; i < port_count; i++) {
-            int remaining = port_count - 1 - i;
-
-            if (i == port_count - 1) {
-                /* Last port: match → accept, no match → reject */
-                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                         flt->ports[i], 0, 0);
-                /* jt → accept, jf → reject: fixup later */
-            } else {
-                /* Not last: match → skip remaining to accept */
-                code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                         flt->ports[i],
-                                                         (uint8_t)remaining, 0);
-            }
+            port_jump_indices[i] = n;
+            code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, flt->ports[i], 0, 0);
         }
+        reject_port_idx = n;
+        code[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JA, 0, 0, 0);
     }
 
     /* ---- Accept ---- */
@@ -123,25 +121,27 @@ static int attach_bpf_filter(int fd, const config_t *cfg)
     /* Ethertype check: jf → reject */
     code[ethertype_jf_idx].jf = (uint8_t)(reject_idx - ethertype_jf_idx - 1);
 
-    /* IP checks: last IP jf → reject */
-    if (ip_count > 0) {
-        /* The last IP check instruction is at after_ip_idx - 1 */
-        int last_ip_idx = after_ip_idx - 1;
-        code[last_ip_idx].jf = (uint8_t)(reject_idx - last_ip_idx - 1);
+    /* IP checks: jump to accept_ip_idx */
+    if (bpf_ip_count > 0) {
+        for (int i = 0; i < bpf_ip_count; i++) {
+            int jmp_instr = ip_jump_indices[i];
+            uint8_t offset = (uint8_t)(accept_ip_idx - jmp_instr - 1);
+            if (BPF_CLASS(code[jmp_instr].code) == BPF_JMP && BPF_OP(code[jmp_instr].code) == BPF_JEQ) {
+                code[jmp_instr].jt = offset;
+            } else {
+                code[jmp_instr].k = offset; /* BPF_JA uses k */
+            }
+        }
+        code[reject_ip_idx].k = (uint32_t)(reject_idx - reject_ip_idx - 1);
     }
 
-    /* Port checks */
+    /* Port checks: jump to accept_idx */
     if (port_count > 0) {
-        /* Last port check: jt → accept, jf → reject */
-        int last_port_idx = accept_idx - 1;
-        code[last_port_idx].jt = (uint8_t)(accept_idx - last_port_idx - 1);
-        code[last_port_idx].jf = (uint8_t)(reject_idx - last_port_idx - 1);
-    }
-
-    /* If no port check, IP match should go directly to accept */
-    if (port_count == 0 && ip_count > 0) {
-        /* After IP match, we fall through to accept (which is right after) */
-        /* The IP OR chain already jumps to after_ip_idx on match, which is accept */
+        for (int i = 0; i < port_count; i++) {
+            int jmp_instr = port_jump_indices[i];
+            code[jmp_instr].jt = (uint8_t)(accept_idx - jmp_instr - 1);
+        }
+        code[reject_port_idx].k = (uint32_t)(reject_idx - reject_port_idx - 1);
     }
 
     struct sock_fprog bpf = { .len = (unsigned short)n, .filter = code };
@@ -222,9 +222,13 @@ int raw_recv_init(const config_t *cfg)
         return -1;
     }
 
-    /* Performance: increase receive buffer */
-    int rcvbuf = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    /* Performance: increase receive buffer (use FORCE to bypass rmem_max) */
+    int rcvbuf = 16 * 1024 * 1024;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        /* Fallback if not root or FORCE not available */
+        rcvbuf = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    }
 
     /* SO_BUSY_POLL intentionally NOT set — it busy-waits in kernel, wasting CPU.
      * Edge-triggered epoll with PACKET_IGNORE_OUTGOING is more efficient. */
@@ -271,4 +275,38 @@ int raw_send(int fd, const config_t *cfg, const uint8_t *frame, int frame_len)
     }
 
     return (int)sent;
+}
+
+int raw_send_batch(int fd, const config_t *cfg,
+                   struct mmsghdr *msgs, int count)
+{
+    /*
+     * Static destination — same pattern as raw_send, initialized once.
+     */
+    static struct sockaddr_ll dest;
+    static int dest_initialized = 0;
+
+    if (__builtin_expect(!dest_initialized, 0)) {
+        memset(&dest, 0, sizeof(dest));
+        dest.sll_family   = AF_PACKET;
+        dest.sll_ifindex  = cfg->outgoing_index;
+        dest.sll_halen    = 6;
+        memcpy(dest.sll_addr, cfg->gateway_mac, 6);
+        dest_initialized = 1;
+    }
+
+    /* Set destination address on all messages */
+    for (int i = 0; i < count; i++) {
+        msgs[i].msg_hdr.msg_name    = &dest;
+        msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+    }
+
+    int sent = sendmmsg(fd, msgs, (unsigned int)count, MSG_DONTWAIT);
+    if (sent < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)
+            LOG_PERROR("raw_send_batch: sendmmsg");
+        return -1;
+    }
+
+    return sent;
 }

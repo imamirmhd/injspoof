@@ -10,7 +10,7 @@
  * on the hot path. Uses atomic operations for thread safety.
  */
 
-#define POOL_DEFAULT_COUNT   4096
+#define POOL_DEFAULT_COUNT   512
 #define POOL_DEFAULT_BUFSIZE 2048
 
 typedef struct {

@@ -22,8 +22,10 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
-#define MAX_EVENTS    64
-#define GC_INTERVAL   15
+#define MAX_EVENTS    256
+#define EPOLL_TIMEOUT_MS 50
+#define GC_INTERVAL   5
+#define RECV_BATCH_SIZE  32
 
 extern volatile sig_atomic_t g_shutdown;
 
@@ -41,8 +43,11 @@ static int create_udp_forwarder(const endpoint_t *ep)
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { LOG_PERROR("server: udp forwarder socket"); return -1; }
 
-    int rcvbuf = 2 * 1024 * 1024;
+    /* Performance: large recv + send buffers for burst absorption */
+    int rcvbuf = 8 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     set_nonblocking(fd);
 
     LOG_INFO("server: UDP forwarder target %s:%u (fd=%d)", ep->address, ep->port, fd);
@@ -156,7 +161,7 @@ int server_run(config_t *cfg)
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, raw_recv_fd, &ev);
 
     if (udp_fwd_fd >= 0) {
-        ev.events = EPOLLIN; ev.data.fd = udp_fwd_fd;
+        ev.events = EPOLLIN | EPOLLET; ev.data.fd = udp_fwd_fd;
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, udp_fwd_fd, &ev);
     }
 
@@ -174,7 +179,7 @@ int server_run(config_t *cfg)
 
     /* ---- Event Loop ---- */
     while (!g_shutdown) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             LOG_PERROR("server: epoll_wait");
@@ -182,9 +187,7 @@ int server_run(config_t *cfg)
         }
 
         /* Update cached timestamp once per batch (avoids per-packet time() syscalls) */
-        session_update_time();
-
-        time_t now = time(NULL);
+        time_t now = session_update_time();
         if (now - last_gc >= GC_INTERVAL) {
             session_gc(sessions);
             last_gc = now;
@@ -195,88 +198,124 @@ int server_run(config_t *cfg)
 
             /* ---- Raw socket: incoming spoofed packet from client ---- */
             if (fd == raw_recv_fd) {
-                /* Edge-triggered: drain all available packets */
+                /* Edge-triggered: drain via recvmmsg batches */
                 for (;;) {
-                uint8_t *buf = (uint8_t *)pool_alloc(&pool);
-                if (!buf) break;
+                /* Pre-allocate batch of buffers from pool */
+                uint8_t *batch_bufs[RECV_BATCH_SIZE];
+                struct mmsghdr batch_msgs[RECV_BATCH_SIZE];
+                struct iovec batch_iovs[RECV_BATCH_SIZE];
+                int batch_count = 0;
 
-                ssize_t n = recv(raw_recv_fd, buf, POOL_DEFAULT_BUFSIZE, MSG_DONTWAIT);
-                if (n <= 0) { pool_free(&pool, buf); break; }
-
-                if (n < (ssize_t)(ETH_HLEN_CONST + IP_HLEN)) {
-                    pool_free(&pool, buf); continue;
+                for (int j = 0; j < RECV_BATCH_SIZE; j++) {
+                    batch_bufs[j] = (uint8_t *)pool_alloc(&pool);
+                    if (!batch_bufs[j]) break;
+                    batch_iovs[j].iov_base = batch_bufs[j];
+                    batch_iovs[j].iov_len  = POOL_DEFAULT_BUFSIZE;
+                    memset(&batch_msgs[j], 0, sizeof(struct mmsghdr));
+                    batch_msgs[j].msg_hdr.msg_iov    = &batch_iovs[j];
+                    batch_msgs[j].msg_hdr.msg_iovlen = 1;
+                    batch_count++;
                 }
 
-                struct iphdr *iph = (struct iphdr *)(buf + ETH_HLEN_CONST);
-                int ip_hlen = iph->ihl * 4;
-                if (n < (ssize_t)(ETH_HLEN_CONST + ip_hlen)) {
-                    pool_free(&pool, buf); continue;
+                if (batch_count == 0) break;
+
+                int nrecvd = recvmmsg(raw_recv_fd, batch_msgs, (unsigned int)batch_count,
+                                      MSG_DONTWAIT, NULL);
+                if (nrecvd <= 0) {
+                    for (int j = 0; j < batch_count; j++)
+                        pool_free(&pool, batch_bufs[j]);
+                    break;
                 }
 
-                uint32_t pkt_src_ip = iph->saddr;
-                uint16_t pkt_src_port = 0;
-                int transport_offset = ETH_HLEN_CONST + ip_hlen;
-                uint8_t *transport = buf + transport_offset;
-                uint8_t *payload = NULL;
-                int payload_len = 0;
-                uint8_t pkt_proto = iph->protocol;
+                /* Return unused buffers */
+                for (int j = nrecvd; j < batch_count; j++)
+                    pool_free(&pool, batch_bufs[j]);
 
-                if (pkt_proto == IPPROTO_TCP) {
-                    if (n < (ssize_t)(transport_offset + TCP_HLEN)) {
+                /* Process received packets */
+                for (int j = 0; j < nrecvd; j++) {
+                    uint8_t *buf = batch_bufs[j];
+                    ssize_t n = (ssize_t)batch_msgs[j].msg_len;
+
+                    if (n < (ssize_t)(ETH_HLEN_CONST + IP_HLEN)) {
                         pool_free(&pool, buf); continue;
                     }
-                    struct tcphdr *tcph = (struct tcphdr *)transport;
-                    pkt_src_port = ntohs(tcph->source);
-                    int tcp_hlen = tcph->doff * 4;
-                    payload = transport + tcp_hlen;
-                    payload_len = (int)n - transport_offset - tcp_hlen;
-                } else if (pkt_proto == IPPROTO_UDP) {
-                    if (n < (ssize_t)(transport_offset + UDP_HLEN)) {
+
+                    struct iphdr *iph = (struct iphdr *)(buf + ETH_HLEN_CONST);
+                    int ip_hlen = iph->ihl * 4;
+                    if (n < (ssize_t)(ETH_HLEN_CONST + ip_hlen)) {
                         pool_free(&pool, buf); continue;
                     }
-                    struct udphdr *udph = (struct udphdr *)transport;
-                    pkt_src_port = ntohs(udph->source);
-                    payload = transport + UDP_HLEN;
-                    payload_len = (int)n - transport_offset - UDP_HLEN;
-                } else {
-                    pool_free(&pool, buf); continue;
+
+                    uint32_t pkt_src_ip = iph->saddr;
+                    uint16_t pkt_src_port = 0;
+                    int transport_offset = ETH_HLEN_CONST + ip_hlen;
+                    uint8_t *transport = buf + transport_offset;
+                    uint8_t *payload = NULL;
+                    int payload_len = 0;
+                    uint8_t pkt_proto = iph->protocol;
+
+                    if (pkt_proto == IPPROTO_TCP) {
+                        if (n < (ssize_t)(transport_offset + TCP_HLEN)) {
+                            pool_free(&pool, buf); continue;
+                        }
+                        struct tcphdr *tcph = (struct tcphdr *)transport;
+                        pkt_src_port = ntohs(tcph->source);
+                        int tcp_hlen = tcph->doff * 4;
+                        payload = transport + tcp_hlen;
+                        payload_len = (int)n - transport_offset - tcp_hlen;
+                    } else if (pkt_proto == IPPROTO_UDP) {
+                        if (n < (ssize_t)(transport_offset + UDP_HLEN)) {
+                            pool_free(&pool, buf); continue;
+                        }
+                        struct udphdr *udph = (struct udphdr *)transport;
+                        pkt_src_port = ntohs(udph->source);
+                        payload = transport + UDP_HLEN;
+                        payload_len = (int)n - transport_offset - UDP_HLEN;
+                    } else {
+                        pool_free(&pool, buf); continue;
+                    }
+
+                    if (payload_len <= 0) { pool_free(&pool, buf); continue; }
+
+                    /* Filter check (pre-compiled IPs) */
+                    if (!filter_match(cfg, pkt_src_ip, pkt_src_port)) {
+                        pool_free(&pool, buf); continue;
+                    }
+
+                    LOG_DEBUG("server: filter MATCHED %d bytes from port %u", payload_len, pkt_src_port);
+
+                    if (cfg->steal_client_source_ip) {
+                        stolen_src_ip = pkt_src_ip;
+                    }
+
+                    /* Session for return path */
+                    session_upsert(sessions,
+                                   pkt_src_ip, pkt_src_port, pkt_proto,
+                                   -1, NULL, 0);
+
+                    /* Forward payload to backend */
+                    if (udp_fwd_fd >= 0) {
+                        sendto(udp_fwd_fd, payload, (size_t)payload_len, MSG_DONTWAIT,
+                               (struct sockaddr *)&udp_fwd_addr, sizeof(udp_fwd_addr));
+                    }
+
+                    pool_free(&pool, buf);
                 }
 
-                if (payload_len <= 0) { pool_free(&pool, buf); continue; }
-
-                /* Filter check (pre-compiled IPs) */
-                if (!filter_match(cfg, pkt_src_ip, pkt_src_port)) {
-                    pool_free(&pool, buf); continue;
-                }
-
-                LOG_DEBUG("server: filter MATCHED %d bytes from port %u", payload_len, pkt_src_port);
-
-                if (cfg->steal_client_source_ip) {
-                    stolen_src_ip = pkt_src_ip;
-                }
-
-                /* Session for return path */
-                session_upsert(sessions,
-                               pkt_src_ip, pkt_src_port, pkt_proto,
-                               -1, NULL, 0);
-
-                /* Forward payload to backend */
-                if (udp_fwd_fd >= 0) {
-                    sendto(udp_fwd_fd, payload, (size_t)payload_len, MSG_DONTWAIT,
-                           (struct sockaddr *)&udp_fwd_addr, sizeof(udp_fwd_addr));
-                }
-
-                pool_free(&pool, buf);
+                /* If we got fewer than requested, socket is drained */
+                if (nrecvd < batch_count) break;
                 } /* end drain loop */
             }
 
             /* ---- UDP forwarder: backend response → raw tunnel ---- */
             else if (fd == udp_fwd_fd) {
+                /* Edge-triggered: drain all available packets */
+                for (;;) {
                 uint8_t *buf = (uint8_t *)pool_alloc(&pool);
-                if (!buf) continue;
+                if (!buf) break;
 
                 ssize_t n = recv(udp_fwd_fd, buf, POOL_DEFAULT_BUFSIZE, MSG_DONTWAIT);
-                if (n <= 0) { pool_free(&pool, buf); continue; }
+                if (n <= 0) { pool_free(&pool, buf); break; }
                 if (n > 65535) {
                     LOG_WARN("server: payload too large (%zd)", n);
                     pool_free(&pool, buf);
@@ -305,11 +344,13 @@ int server_run(config_t *cfg)
 
                 /* Build response: spoofed src → client */
                 uint8_t *pkt_buf = (uint8_t *)pool_alloc(&pool);
-                if (!pkt_buf) { pool_free(&pool, buf); continue; }
+                if (!pkt_buf) { pool_free(&pool, buf); break; }
+                uint8_t *scratch = (uint8_t *)pool_alloc(&pool);
+                if (!scratch) { pool_free(&pool, pkt_buf); pool_free(&pool, buf); break; }
 
                 int rc;
                 if (use_tcp_resp) {
-                    rc = pkt_send_tcp_fragmented(pkt_buf,
+                    rc = pkt_send_tcp_fragmented(pkt_buf, scratch,
                                                  cfg->outgoing_mac, cfg->gateway_mac,
                                                  resp_src_ip, client_addr.s_addr,
                                                  resp_src_port, cfg->remote.port,
@@ -318,7 +359,7 @@ int server_run(config_t *cfg)
                                                  cfg->fragment_size,
                                                  raw_send_cb, &send_ctx);
                 } else {
-                    rc = pkt_send_udp_fragmented(pkt_buf,
+                    rc = pkt_send_udp_fragmented(pkt_buf, scratch,
                                                  cfg->outgoing_mac, cfg->gateway_mac,
                                                  resp_src_ip, client_addr.s_addr,
                                                  resp_src_port, cfg->remote.port,
@@ -338,8 +379,10 @@ int server_run(config_t *cfg)
 #endif
                 }
 
+                pool_free(&pool, scratch);
                 pool_free(&pool, pkt_buf);
                 pool_free(&pool, buf);
+                } /* end drain loop */
             }
         }
     }
